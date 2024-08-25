@@ -1,0 +1,257 @@
+
+#include "Arduino.h"
+
+
+// Define commands
+#define POWERNOFF 0x0A
+#define VOLUP 0x04
+#define VOLDOWN 0x05
+#define SOURCE 0x08
+#define EQUALIZER 0x0D
+#define MUTE 0x0E
+#define NEXTTRACK 0x12
+#define PREVTRACK 0x13
+#define FOLDERFORW 0x14
+#define FOLDERBACK 0x15
+
+
+// Connect optocoupler input through a 1k resistor to this pin
+#define OUTPUTPIN 18
+
+// On-board LED, useful for debugging
+#define LEDPIN 15
+
+struct ADCInstance {
+  int ADC_Pin;
+  int* value_min;     // Pointer to array of minimum values for ranges
+  int* value_max;     // Pointer to array of maximum values for ranges
+  int num_ranges;     // Number of ranges
+  int sensorValuelast; // Last sensor value
+  int output;  // Flag to indicate if a button was found
+};
+
+int value_min1[] = { 1200, 500,   3000, 0   };//vol up / Vol DN / Skip DN / Off
+int value_max1[] = { 1600, 1100,  4000, 200 };
+
+int value_min2[] = {500};//Skip Up
+int value_max2[] = {2000};
+
+int value_min3[] = {3000, 4000};//FM /CD
+int value_max3[] = {4000, 5000};
+
+// Create instances for each ADC configuration
+ADCInstance adc1 = {A0, value_min1, value_max1, 4, 0, -1};
+ADCInstance adc2 = {A1, value_min2, value_max2, 1, 0, -1};
+ADCInstance adc3 = {A2, value_min3, value_max3, 2, 0, -1};
+
+
+
+// Pulse width in µs
+#define PULSEWIDTH 555
+
+// Address that the radio responds to
+#define ADDRESS 0x47  //47
+
+unsigned long currentTime, holdbutton;
+unsigned long loopTime;
+int PrevState = 0;
+
+void setup() {
+
+  uint32_t Freq = 0;
+  Serial.begin(115200);
+  delay(5000);
+  currentTime = millis();
+  loopTime = currentTime;
+  pinMode(OUTPUTPIN, OUTPUT);    // Set the proper pin as output
+  digitalWrite(OUTPUTPIN, LOW);  // Output LOW to make sure optocoupler is off
+
+  pinMode(LEDPIN, OUTPUT);  // Set pin connected to on-board LED as output...
+  digitalWrite(LEDPIN, LOW);
+
+  digitalWrite(LEDPIN, HIGH);
+  delay(1000);
+  digitalWrite(LEDPIN, LOW);
+  // ...and turn LED off
+
+
+  currentTime = millis();
+  holdbutton = currentTime;
+}
+
+void getADC_Y(ADCInstance* instance) {
+  // Read the analog value from the specified pin
+  int sensorValue = analogRead(instance->ADC_Pin);
+  
+
+  // Check if the sensor value is below a threshold
+  if (sensorValue < 7000) {
+    Serial.println(sensorValue);
+    if (instance->output == -1) {
+      // Check if the sensor value is stable
+      if (abs(instance->sensorValuelast - sensorValue) < 10) {
+        // Loop through the defined ranges to find where the sensor value falls
+        for (int i = 0; i < instance->num_ranges; i++) {
+          if ((sensorValue >= instance->value_min[i]) && (sensorValue < instance->value_max[i])) {
+            instance->output = i;
+            instance->sensorValuelast = sensorValue; // Update the last sensor value
+          }
+        }
+      }
+      // Update the last sensor value if the button is not found
+      instance->sensorValuelast = sensorValue;
+    }
+  } else {
+    instance->output = -1;
+  }
+}
+
+
+
+unsigned char GetInput() {
+
+  currentTime = millis();
+
+  if (currentTime >= (loopTime + 10)) {
+    
+    //Serial.print("sensor1:");
+    getADC_Y(&adc1);
+    //Serial.print("sensor2:");
+    getADC_Y(&adc2);
+    //Serial.print("sensor3:");
+    getADC_Y(&adc3);
+
+    bool VOLUP_PIN = (adc1.output == 0);
+    bool VOLDOWN_PIN = (adc1.output == 1);
+    bool PREVTRACK_PIN = (adc1.output == 2);
+    bool Pause_PIN = (adc1.output == 3);
+
+    bool NEXTTRACK_PIN = (adc2.output == 0);
+
+    bool SOURCE_PIN = (adc3.output >= 0);
+
+            
+    //VOLUP
+    if (VOLUP_PIN && currentTime >= (holdbutton + 250)) {
+      holdbutton = currentTime;
+      return VOLUP;
+    } 
+
+    //VOLDOWN
+    if (VOLDOWN_PIN && currentTime >= (holdbutton + 250)) {
+      holdbutton = currentTime;
+      return VOLDOWN;
+    } 
+
+    //NEXTTRACK
+    if (PrevState == 0 && NEXTTRACK_PIN && currentTime >= (holdbutton + 500)) {
+      PrevState = NEXTTRACK;
+      return NEXTTRACK;
+    } else if (PrevState == NEXTTRACK && !NEXTTRACK_PIN) {
+      holdbutton = currentTime;
+      PrevState = 0;
+    }
+
+    //PREVTRACK
+    if (PrevState == 0 && PREVTRACK_PIN && currentTime >= (holdbutton + 500)) {
+      PrevState = PREVTRACK;
+      return PREVTRACK;
+    } else if (PrevState == PREVTRACK && !PREVTRACK_PIN) {
+      holdbutton = currentTime;
+      PrevState = 0;
+    }
+
+
+    //PAUSE(LONG PUSH 1sec)
+    if (Pause_PIN && currentTime >= (holdbutton + 1000)) {      
+      holdbutton = currentTime;
+      return MUTE;
+    }
+
+    //SOURCE(LONG PUSH 1sec)
+    if (SOURCE_PIN && currentTime >= (holdbutton + 1000)) {      
+      holdbutton = currentTime;
+      return SOURCE;
+    }
+    loopTime = currentTime;  // Updates loopTime
+  }
+  return 0;
+}
+
+void loop() {
+  unsigned char Key = GetInput();
+  if (Key) {
+  Serial.println(Key);
+    SendCommand(Key);
+    delay(2);
+    SendCommand(Key);
+    delay(20);
+  }
+}
+
+// Send a value (7 bits, LSB is sent first, value can be an address or command)
+void SendValue(unsigned char value) {
+  unsigned char i, tmp = 1;
+  for (i = 0; i < sizeof(value) * 8 - 1; i++) {
+    if (value & tmp)  // Do a bitwise AND on the value and tmp
+      SendOne();
+    else
+      SendZero();
+    tmp = tmp << 1;  // Bitshift left by 1
+  }
+}
+
+// Send a command to the radio, including the header, start bit, address and stop bits
+void SendCommand(unsigned char value) {
+  unsigned char i;
+  Preamble();
+  for (i = 0; i < 1; i++) {           // Repeat address, command and stop bits three times so radio will pick them up properly
+    SendValue(ADDRESS);               // Send the address
+    SendValue((unsigned char)value);  // Send the command
+    Postamble();                      // Send signals to follow a command to the radio
+  }
+}
+
+// Signals to transmit a '0' bit
+void SendZero() {
+  digitalWrite(OUTPUTPIN, HIGH);  // Output HIGH for 1 pulse width
+  digitalWrite(LEDPIN, HIGH);     // Turn on on-board LED
+  delayMicroseconds(PULSEWIDTH);
+  digitalWrite(OUTPUTPIN, LOW);  // Output LOW for 1 pulse width
+  digitalWrite(LEDPIN, LOW);     // Turn off on-board LED
+  delayMicroseconds(PULSEWIDTH);
+}
+
+// Signals to transmit a '1' bit
+void SendOne() {
+  digitalWrite(OUTPUTPIN, HIGH);  // Output HIGH for 1 pulse width
+  digitalWrite(LEDPIN, HIGH);     // Turn on on-board LED
+  delayMicroseconds(PULSEWIDTH);
+  digitalWrite(OUTPUTPIN, LOW);  // Output LOW for 3 pulse widths
+  digitalWrite(LEDPIN, LOW);     // Turn off on-board LED
+  delayMicroseconds(PULSEWIDTH * 3);
+}
+
+// Signals to precede a command to the radio
+void Preamble() {
+  // HEADER: always LOW (1 pulse width), HIGH (16 pulse widths), LOW (8 pulse widths)
+  digitalWrite(OUTPUTPIN, LOW);  // Make sure output is LOW for 1 pulse width, so the header starts with a rising edge
+  digitalWrite(LEDPIN, LOW);     // Turn off on-board LED
+  delayMicroseconds(PULSEWIDTH * 1);
+  digitalWrite(OUTPUTPIN, HIGH);  // Start of header, output HIGH for 16 pulse widths
+  digitalWrite(LEDPIN, HIGH);     // Turn on on-board LED
+  delayMicroseconds(PULSEWIDTH * 16);
+  digitalWrite(OUTPUTPIN, LOW);  // Second part of header, output LOW 8 pulse widths
+  digitalWrite(LEDPIN, LOW);     // Turn off on-board LED
+  delayMicroseconds(PULSEWIDTH * 8);
+
+  // START BIT: always 1
+  SendOne();
+}
+
+// Signals to follow a command to the radio
+void Postamble() {
+  // STOP BITS: always 1
+  SendOne();
+  SendOne();
+}
